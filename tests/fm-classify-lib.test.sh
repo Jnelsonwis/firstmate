@@ -106,11 +106,20 @@ ACTIONABLE="$TMP/actionable.status"
 BENIGN="$TMP/benign.status"
 printf 'working: still going\n' > "$BENIGN"
 printf 'blocked: needs a credential\n' > "$ACTIONABLE"
-signal_reason_is_actionable "$BENIGN" "$ACTIONABLE" \
-  || fail "a captain-relevant line anywhere in the list is actionable"
-! signal_reason_is_actionable "$BENIGN" "$TMP/task.turn-ended" \
-  || fail "no captain-relevant .status line (and a skipped non-status arg) is not actionable"
-pass "signal_reason_is_actionable is 0 iff some listed .status file's last line is captain-relevant"
+# signal_files_actionable lives in bin/fm-watch.sh (it replaced
+# signal_reason_is_actionable upstream in #3268). Sourcing the watcher returns
+# before its runtime; a subshell keeps its globals and a throwaway STATE (no
+# seen markers, so each whole file is classified) out of the rest of this file.
+(
+  export FM_STATE_OVERRIDE="$TMP/watch-state"
+  # shellcheck source=/dev/null
+  . "$ROOT/bin/fm-watch.sh"
+  signal_files_actionable "$BENIGN" "$ACTIONABLE" \
+    || fail "a captain-relevant line anywhere in the list is actionable"
+  ! signal_files_actionable "$BENIGN" "$TMP/task.turn-ended" \
+    || fail "no captain-relevant .status line (and a skipped non-status arg) is not actionable"
+) || exit 1
+pass "signal_files_actionable is 0 iff some listed .status file carries a captain-relevant line"
 
 # --- absorb classification via a stubbed crew-state reader -------------------
 #
