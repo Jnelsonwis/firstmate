@@ -1,0 +1,63 @@
+# Per-adapter US-filter / country-source matrix
+
+Audited 2026-07-14 (all 32 adapters + sync-one/sync-all/job-details read). Rows go stale as
+`docs/plans/2026-07-14-jobfeed-us-coverage-and-efficiency.md` tasks land — update the row when
+you fix an adapter. "US filter: NONE" = policy violation (June 2026 US-only).
+
+Reference implementations: **server-side facet** = `workday.ts` / `oracle-cloud.ts` ·
+**2-stage (listing pre-filter → detail only for US)** = `jazzhr.ts` / `rippling.ts` ·
+**board-country cache** = `workday.ts` `config.boardCountry` via `onResolvedConfig` (sync-one.ts).
+
+| adapter | country source | US filter | server-side possible? | detail cap | board-cache? | waste notes |
+|---|---|---|---|---|---|---|
+| workday | detail `country.id` GUID + `locationCountry` facet | **server** (US facet, global GUID `bc33…ed09`) + NON_US board skip | in use | `WORKDAY_DETAIL_MAX` | **yes** | reference impl; cluster cached |
+| oracle_cloud | `PrimaryLocationCountry`/`CountryCode` | **server** (`selectedLocationsFacet`, pod-specific IDs from page 0) | in use | `ORACLE_DETAIL_MAX` (=40), **knownJobs-partitioned 2026-08-31**: budget goes to un-described rows only; known-enriched re-emit listing-only null-desc | facet per run (cheap) | reference impl; pre-08-31 the ShortDescriptionStr fallback blurb-locked 54k rows — fixed + one-time NULLing UPDATE executed 2026-08-31 (57,979 rows), backfilling via drain (description-coverage.md) |
+| adzuna | country-scoped feed URL | **server** (feed=us) + designated-account guard (`adzuna.ts:116-125`) | in use | none (20×50) | n/a | reference-good |
+| careerjet | `locations` parsed | **server** (`locale_code:'en_US'` pinned, `careerjet.ts:127`) | in use | none (10×99) | no | dedupe treadmill is downstream, not the adapter |
+| jobs2careers | listing `state` code | client (US state/DC/territory allowlist; missing-state drops) | no country param (private web API; `workType` filter 400s — don't send) | none — full HTML desc inline in search response, no detail fetch | n/a | metro shards (15) × 16 queries × ≤4 pages, 1.5s delay; native `id` stable (2026-08-10 probe); `link` is click.php w/ churning params — NEVER id material; salary real in `salaryDetails` (gate on min/max, not object) |
+| jazzhr | listing `<td>` + JSON-LD detail | client **2-stage** (pre+post) | no (HTML) | details all (conc 6) | no | good 2-stage |
+| rippling | `workLocation.label`/`workLocations` | client **2-stage** | no | details all (conc 4) | no | good; DON'T shard (Cloudflare) |
+| greenhouse | `location.name`+`offices[]` | client any-US | no param | none (1 call) | no | low cost |
+| lever | `categories.allLocations` | client any-US | no param | none (1 call) | no | low cost |
+| ashby | `location`+`secondaryLocations` | client any-US | no param | none (1 call) | no | low cost |
+| gem | `locations[].isoCountry` | client (US or remote) | no | none (1 GraphQL) | no | low cost |
+| recruitee | `country`/`country_code` | client | no param | none (1 call) | no | Dutch ATS; board-cache candidate |
+| teamtailor | `_jobposting` schema.org | client (keeps null!) | no param | none (1 call) | no | Swedish; 57.8% US |
+| jobvite | `jobLocation`/`location` | client | no param | none (1 call) | no | low |
+| breezy | `location` struct/string | client | no param | none (1 call) | no | SMB-global; board-cache candidate |
+| smartrecruiters | listing `location.country` | **server** (`country=us`, verified abbvie 1,656→989) + listing pre-filter + client backstop | in use | **`SMARTRECRUITERS_DETAIL_MAX`=1500 + `_MS`=15min (2026-08-11)**, on top of the 2026-07-19 incremental skip (`AdapterFetchOpts.knownJobs`: details only for unknown/description-less postings; known+desc rows re-emit listing-only). Capped/timed-out/**failed** details all fall back to the listing row | no | **The incremental skip does NOT hold on dominos** — that board recycles `external_id`s, so listing↔DB overlap is only 39.6% and `needDetail` measured **15,051**, not the ~1-3k this row used to claim. At the 600 ms shared-host queue (ALL tenants share `api.smartrecruiters.com`, so `DETAIL_CONCURRENCY`=4 buys nothing → 1.67 req/s) that was ~150 min vs the 117 min ats-sync timeout: 3 of 4 runs killed rc=124, account frozen since 08-06. Cap fixes the timeout but does NOT converge coverage (churn refills the tail); real fix is a canonical-hash probe before the detail fetch. Listing has NO updatedOn and releasedDate is re-release churn — do not "improve" the skip rule with date matching. Full writeup: `job_feed/docs/smartrecruiters-detail-cap-2026-08-11.md` |
+| bamboohr | `location.addressCountry` (**detail only**) | client (keeps null) | no param | **details every job** | no | board-cache candidate (highest detail savings) |
+| successfactors | `g:location` trailing-ISO | client (drops null too) | no param | none (whole feed) | no | global board parsed then dropped; board-cache candidate |
+| icims | **none at listing** (sitemap = title only) | **enrich-time only** (`US_ONLY_ENFORCED_AT_ENRICHMENT`) | no (sitemap) | async `job-details-drain` | no | rows land country=NULL until drained; prioritize drain |
+| phenom | listing `country` | client (`/united states/`) though body sends `country:'us'` | partial (sends country:us + global:true) | DETAIL_MAX 300, **knownJobs-partitioned 2026-08-31** (`descriptionLength >= 600` = full; teaser rows + new compete for budget) | **yes** — `config.jobPagePrefix` probed per sync (302 `location` + locale stamps) and persisted via onResolvedConfig | pre-08-31: wrong locale prefix silently 302'd ALL detail fetches on some tenants (100%-teaser accounts) + budget burned on first-300-by-position; both fixed, converges ~300/account/sync (description-coverage.md) |
+| taleo | `column[locationsColumns]` "ST-City" | client (keep-US) | no | DETAIL_MAX 300 | **no — re-discovers portal EVERY sync** | cache portal via onResolvedConfig (plan Task 11) |
+| pinpoint | none — city/province free text via parseLocation | client (drops unverifiable) | no param | none (1 `postings.json` call) | n/a | JD split across 4 fields — adapter composes description + key_responsibilities + skills_knowledge_expertise + benefits since 2026-08-31 (before: intro-only ~300ch rows); NO posted-date field → ages out via missing_syncs only |
+| eightfold | `locations`/`standardizedLocations` | **server** (`location=United States`, commit 6c6e083c) + client any-US backstop | in use | details conc 3 + 150ms pace + 8-consecutive-fail WAF breaker (2026-07-19); **enriches only US-passing positions** (2026-07-25) | **yes** — `boardCountry` + `boardCountryAt`, 30-day re-check (2026-07-25) | Page size is **server-fixed at 10** (`num`/`size`/`num_results` ignored) — 600 seq requests/tenant is NOT fixable client-side. `boardCountry:'NON_US'` only caches on a **witness** (postings that all fail the US filter), never on an empty result — so with the server filter live it rarely fires (non-US tenants return 0 positions). us_pct 50.9%→99.4%, avg run 76s→57.2s. CF WAF 403s the detail XHR on some tenants (nvidia/qualcomm/jhu/tailoredbrands/ericsson/bostonscientific → `waf_blocked`, desc gaps); breaker stops the hammer so the cooldown can clear; `Bun` tsc error FIXED (c1e72408) |
+| workable | `location.country`/`countryCode` (structured!) | **NONE** | no param but structured country in listing | none (1 call) | no | trivial fix (plan Task 8) |
+| brassring | JSON-LD `addressCountry` per job page | **NONE** (and rows land 100% NULL) | no (sitemap crawl) | MAX_JOBS 10k / 12-min budget | no | whole provider invisible to US filter (plan Task 3) |
+| avature | JSON-LD | **NONE** | no (HTML crawl) | ≤1000 pages | no | no US drop |
+| jsonld | JSON-LD | **NONE** (dedupe only) | no (HTML crawl) | ≤500 | no | no US drop |
+| join | JSON-LD `jobLocation` | **NONE** | no (HTML scrape) | none | no | German ATS, 0 US ever |
+| personio | `office`/`subcompany` text (weak) | **NONE** | no param | none | no | EU-only ATS; isRemote always false |
+| usajobs | `PositionLocation[].CountryCode` | client (`==='US'`) | yes but low value (federal≈US) | none | no | FIXED 2026-07-16: Search API hard-caps EVERY query at 10k (CountAll clamps too) — old unfiltered walk silently dropped ~1/3 of feed; now Organization-sliced (25 dept codes, recurse to 4-char sub-agencies on clamp), ~75 req/28s, 12.1k US jobs; external_id = MatchedObjectId control number (PositionID collided across agencies), actives migrated in place; **no incremental** (plan Task 11) |
+| themuse | `locations[].name` | client (drop non-US + remote) | broken upstream (documented) | none (25×20) | no | **no date sort** → arbitrary 500-slice, can't prefer newest |
+| remotive | `candidate_required_location` | **NONE** (forces isRemote, keeps all) | no country param | none (1 call, limit=2000) | no | 12.5% US; needs client US drop (plan Task 7) |
+| arbeitnow | `location` | **NONE** | no country param | none (≤20 pages) | no | EU feed, 0% US; drop from ALWAYS_ON (plan Task 7) |
+| jooble | `location` string parsed (`jooble.ts:120-125`) | client keep-US in BOTH writers (adapter + `aggregator-ingest.ts` since 2026-07-19) + soft server `location=United States` hint | in use | none (25 pages) | no | FIXED 2026-07-19: ingest now verifies + stamps country=US (was NULL); 941 NULLs backfilled from job_locations, 3,870 unverifiable actives expired; 16 keyword accounts US-scoped upstream |
+| careerplug | listing `ST-City-ZIP` row text (state 2-letter code) or JSON-LD detail `jobLocation.address.addressCountry` | client (`location.country !== 'US'` drops the row) | no param (HTML board, no country query) | `CAREERPLUG_DETAIL_MAX` (=200) | no | writer = `careerplug.ts` pipeline adapter; host floor **1,200 ms** (`CAREERPLUG_MIN_DELAY_MS`, shared host GROUP across careerplug.com + apscareerportal.com — not the 600 ms default, Ruling R8 2026-09-06); §17c `city_has_dash_label` OPEN, 257 active rows not fully caught by `3922c4a2` (provider-notes § Wave 3 spike) |
+| hireology | `locations[].state` (2-letter; API sends no country field at all) | client (`.filter(l => l.country === 'US')` post state-inference) | no param (keyless public API, no country filter) | none — no detail phase, the listing IS the whole record | no | writer = `hireology.ts` pipeline adapter; 600 ms default host floor (`api.hireology.com`); CA share expected to ride along uncaught at roughly talentreef's ~0.5% order |
+| talentreef | ES doc `address.country` | **server** (`{term:{'address.country':'US'}}` in the query) + client backstop (`location.country !== 'US'`) | in use | none — no detail phase, `_source` is the whole record | no | writer = `talentreef.ts` pipeline adapter; 600 ms default host floor (single host, `prod-kong…internal.talentreef.com`); measured US 99.5% / CA 0.5% |
+| harri | listing `locations[].country_code` (client gate) + detail address | client (`country_code !== 'US'` skipped; server-side US gate not available — UK+US provider, e.g. Azumi ~40% London) | no param | `HARRI_DETAIL_MAX`=100 | no | writer = `harri.ts` pipeline adapter; 600 ms default host floor (single `gateway.harri.com` host); `duration_mode: EVERGREEN` postings carry stale `posted_at` (provider-notes § Wave 3 spike) |
+
+## Non-adapter writers
+
+| writer | providers | country behavior |
+|---|---|---|
+| `scripts/ats-ingest.ts` | recruiterbox, mercor | `ImportJob` (:107-121) has NO country field → all rows `country=NULL` (still ungated) |
+| n8n → `/api/n8n/jobs/import` (`src/routes/n8n.ts:307`) → `upsertPgJob` | hiring_cafe, snagajob, + Free Boards workflow `nhEjA1pIgQTgex39` (jobicy, remoteok, himalayas, workingnomads, jobspy) | Since commit `86113788` (2026-07-14) the route accepts `country` and DROPS non-US rows; missing country still passes (legacy hiring_cafe/snagajob don't send it yet → their rows stay NULL/invisible). Free Boards sends `country:'US'` verified per source. |
+
+## Pipeline-level notes
+
+- sync-all already excludes at the query: quarantined accounts, config-empty aggregator fan-out rows, unsupported providers.
+- **No adapter has a changed-since/incremental LISTING fetch** — every selected board's listing is walked in full each rotation. The DETAIL phase, though, is incremental on 8 adapters via `AdapterFetchOpts.knownJobs` (smartrecruiters, workday, eightfold, breezy, taleo, hiringcafe, phenom, oracle_cloud): known-enriched jobs re-emit listing-only with a NULL description (description-coverage.md invariant).
+- `markMissingJobs` gates on `fetchSucceeded` (2026-07-14 fix) — an empty US-filtered result still sweeps correctly, but ONLY for accounts that sync (inactive/no-op accounts create immortals — decision table).
